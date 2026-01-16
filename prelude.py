@@ -1,9 +1,8 @@
 import logging
-from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import requests
 
 from model_development import precompute_features
 
@@ -19,9 +18,8 @@ logging.basicConfig(
 )
 
 # Configuration
-YESTERDAY = (pd.Timestamp.now().normalize() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 BACKTEST_START = "2018-01-01"
-BACKTEST_END = YESTERDAY
+BACKTEST_END = None  # Will use latest available date from data
 INVESTMENT_WINDOW = 12  # months (deprecated: use WINDOW_OFFSET for consistency)
 PURCHASE_FREQ = "Daily"  # Daily frequency for DCA purchases
 # Standard 1-year window used across all modules
@@ -34,11 +32,20 @@ WEIGHT_SUM_TOLERANCE = 1e-5
 
 
 def load_data():
-    """Load BTC data from CoinMetrics CSV with complete 2025 price history."""
-    url = "https://raw.githubusercontent.com/coinmetrics/data/refs/heads/master/csv/btc.csv"
-
-    logging.info("Loading CoinMetrics BTC data...")
-    df = pd.read_csv(BytesIO(requests.get(url).content))
+    """Load BTC data from CoinMetrics CSV.
+    
+    Loads from local file: data/Coin Metrics/coinmetrics_btc.csv
+    """
+    local_path = Path("data/Coin Metrics/coinmetrics_btc.csv")
+    
+    if not local_path.exists():
+        raise FileNotFoundError(
+            f"CoinMetrics BTC data file not found at {local_path}. "
+            "Please ensure the file exists in the data/Coin Metrics/ directory."
+        )
+    
+    logging.info(f"Loading CoinMetrics BTC data from local file: {local_path}")
+    df = pd.read_csv(local_path)
 
     # Set time as index
     df["time"] = pd.to_datetime(df["time"])
@@ -55,31 +62,7 @@ def load_data():
     # Rename PriceUSD to PriceUSD_coinmetrics for compatibility
     df["PriceUSD_coinmetrics"] = df["PriceUSD"]
 
-    # Check if today's date exists in the data
-    today = pd.Timestamp.now().normalize()
-    if today not in df.index:
-        logging.warning(
-            f"Today's date ({today.date()}) missing from dataframe. Proceeding with available data."
-        )
-
-    # Ensure we have today's MVRV value (use yesterday's if missing)
-    MVRV_COL = "CapMVRVCur"
-    if MVRV_COL in df.columns and today in df.index:
-        if pd.isna(df.loc[today, MVRV_COL]):
-            yesterday = today - pd.Timedelta(days=1)
-            if yesterday in df.index and pd.notna(df.loc[yesterday, MVRV_COL]):
-                df.loc[today, MVRV_COL] = df.loc[yesterday, MVRV_COL]
-                logging.info(
-                    f"Used yesterday's MVRV value ({df.loc[yesterday, MVRV_COL]:.4f}) for {today.date()}"
-                )
-            else:
-                logging.warning(
-                    f"Could not find valid MVRV for {today.date()}. "
-                    f"Yesterday ({yesterday.date()}) not available or also missing MVRV."
-                )
-
     # Assert all dates from BACKTEST_START to the latest available date have BTC-USD prices
-    # Use the latest date in the dataframe instead of today, since we removed live price fetching
     latest_date = df.index.max()
     backtest_dates = df.index[
         (df.index >= pd.to_datetime(BACKTEST_START)) & (df.index <= latest_date)
@@ -193,6 +176,8 @@ def compute_cycle_spd(
     """
     start = start_date or BACKTEST_START
     end = end_date or BACKTEST_END
+    if end is None:
+        end = dataframe.index.max().strftime("%Y-%m-%d")
 
     # Use provided features or compute them
     if features_df is None:
@@ -339,7 +324,8 @@ def check_strategy_submission_ready(dataframe: pd.DataFrame, strategy_function) 
     passed = True
 
     # Forward-leakage test
-    backtest_df = dataframe.loc[BACKTEST_START:BACKTEST_END]
+    backtest_end = BACKTEST_END or dataframe.index.max().strftime("%Y-%m-%d")
+    backtest_df = dataframe.loc[BACKTEST_START:backtest_end]
     full_weights = strategy_function(dataframe).reindex(backtest_df.index).fillna(0.0)
 
     for probe in backtest_df.index[:: max(len(backtest_df) // 50, 1)]:
@@ -358,9 +344,10 @@ def check_strategy_submission_ready(dataframe: pd.DataFrame, strategy_function) 
 
     # Weight validation per rolling window (using 1-year windows)
     window_offset = WINDOW_OFFSET
+    backtest_end = BACKTEST_END or dataframe.index.max().strftime("%Y-%m-%d")
     for start in pd.date_range(
         pd.to_datetime(BACKTEST_START),
-        pd.to_datetime(BACKTEST_END) - window_offset,
+        pd.to_datetime(backtest_end) - window_offset,
         freq=PURCHASE_FREQ_TO_OFFSET[PURCHASE_FREQ],
     ):
         end = start + window_offset

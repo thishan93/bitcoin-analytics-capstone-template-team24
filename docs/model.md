@@ -391,3 +391,139 @@ The model requires the following columns from the CoinMetrics BTC data:
 | `CapMVRVCur` | Market Value to Realized Value ratio | Optional* |
 
 *If MVRV data is not available, the model falls back to neutral signals (no dynamic adjustment).
+
+## Improvements Over a Simple 200-Day MA Model
+
+A simple 200-day moving average strategy typically generates binary signals: buy when price is below the MA, reduce exposure when above. While effective as a trend filter, this approach has significant limitations that our enhanced model addresses.
+
+### Limitations of Simple 200-Day MA
+
+| Limitation | Description |
+|------------|-------------|
+| Binary signals | Only considers above/below MA, ignoring magnitude |
+| No valuation context | Doesn't account for whether Bitcoin is fundamentally over/undervalued |
+| Whipsaw prone | Frequent false signals when price oscillates around the MA |
+| No cycle awareness | Ignores Bitcoin's 4-year halving cycle dynamics |
+| Static thresholds | Same response regardless of market regime |
+| No confidence weighting | Treats all signals with equal conviction |
+
+### How This Model Improves
+
+#### 1. Multi-Signal Integration
+
+Instead of relying solely on price vs. MA, the model combines three weighted signals:
+
+```
+combined = MVRV_value × 0.70 + MA_signal × 0.20 + percentile_signal × 0.10
+```
+
+The 200-day MA contributes only 20% of the final signal, acting as a secondary confirmation rather than the primary driver. The MVRV Z-score (70% weight) provides fundamental valuation context that the MA cannot.
+
+#### 2. Continuous vs. Binary Response
+
+**Simple MA Model:**
+```python
+signal = 1 if price < ma_200 else 0  # Binary
+```
+
+**Enhanced Model:**
+```python
+price_vs_ma = (price / ma_200) - 1  # Continuous in [-1, 1]
+ma_signal = -price_vs_ma * trend_modifier  # Scaled and modulated
+```
+
+The enhanced model responds proportionally to *how far* price is from the MA, not just whether it's above or below.
+
+#### 3. Adaptive Trend Modulation
+
+The MA signal is dynamically adjusted based on MVRV regime:
+
+| MVRV Zone | Trend Threshold | Effect |
+|-----------|-----------------|--------|
+| Value (Z < -1) | 0.1 (low) | More sensitive to reversals—catch bottoms earlier |
+| Neutral | 0.2 (standard) | Normal responsiveness |
+| Danger (Z > 1.5) | 0.4 (high) | Require stronger confirmation—avoid false signals at tops |
+
+This means the model becomes more aggressive when MVRV indicates undervaluation, even if price is near the MA.
+
+#### 4. Asymmetric Extreme Response
+
+A simple MA model treats a 10% deviation above the MA the same as 10% below. Our model recognizes Bitcoin's asymmetric behavior:
+
+```python
+# Deep value (Z < -2): Quadratic positive boost
+boost = 0.8 * (Z + 2)² + 0.5  # Aggressive accumulation
+
+# Danger zone (Z ≥ 2.5): Quadratic negative boost  
+boost = -0.5 * (Z - 2.5)² - 0.3  # Strong reduction
+```
+
+Extreme lows are rare opportunities; extreme highs often precede corrections.
+
+#### 5. 4-Year Halving Cycle Context
+
+The simple MA has no awareness of Bitcoin's halving cycle. Our model incorporates a 1,461-day (≈4 year) rolling percentile:
+
+```python
+mvrv_percentile = rolling_percentile(mvrv, window=1461)
+pct_signal = sign(0.5 - percentile) * |2 * (0.5 - percentile)|^1.5
+```
+
+This provides context for whether current conditions are historically cheap or expensive within the halving cycle.
+
+#### 6. Momentum and Acceleration Detection
+
+The simple MA is a lagging indicator with no momentum awareness. Our model adds:
+
+- **MVRV Gradient**: 30-day EMA-smoothed trend direction
+- **MVRV Acceleration**: Second derivative for momentum detection
+
+```python
+accel_modifier = [0.85, 1.15]  # Amplify when momentum builds, dampen at reversals
+```
+
+#### 7. Signal Confidence Weighting
+
+When multiple signals agree, the model increases conviction:
+
+```python
+# High confidence (> 0.7): boost up to 1.15×
+confidence_boost = 1.0 + 0.15 * (confidence - 0.7) / 0.3
+```
+
+A simple MA model has no concept of signal agreement or confidence.
+
+#### 8. Volatility-Aware Dampening
+
+During high uncertainty periods (volatility > 80th percentile), the model reduces signal strength:
+
+```python
+volatility_dampening = 1.0 - 0.2 * (volatility - 0.8) / 0.2  # Down to 0.8×
+```
+
+This prevents overreaction during chaotic market conditions where the MA generates unreliable signals.
+
+### Comparative Summary
+
+| Aspect | Simple 200-Day MA | Enhanced Model |
+|--------|-------------------|----------------|
+| Signal type | Binary (above/below) | Continuous with magnitude |
+| Valuation awareness | None | MVRV Z-score (70% weight) |
+| Cycle context | None | 4-year halving percentile |
+| Trend sensitivity | Fixed | Adaptive to MVRV regime |
+| Extreme response | Linear/symmetric | Asymmetric quadratic boost |
+| Momentum detection | None | Gradient + acceleration |
+| Confidence weighting | None | Signal agreement scoring |
+| Volatility handling | None | Dampening in high uncertainty |
+| Look-ahead protection | Often violated | 1-day lag on all features |
+
+### When the Simple MA Still Wins
+
+The simple MA model has advantages in specific scenarios:
+
+1. **Simplicity**: Easier to understand, audit, and explain
+2. **Robustness**: Fewer parameters means less overfitting risk
+3. **No data dependencies**: Works with price data alone (no MVRV required)
+4. **Faster computation**: Single rolling mean vs. multiple feature calculations
+
+Our model falls back to MA-only behavior when MVRV data is unavailable, ensuring graceful degradation.

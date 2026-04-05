@@ -1,13 +1,25 @@
-"""Dynamic DCA weight computation using 200-day MA strategy.
+"""Dynamic DCA weight computation using Gradient Boosting on-chain valuation model.
 
 This module computes daily investment weights for a Bitcoin DCA strategy
-based on a simple 200-day moving average signal:
-- Buy more when price is below the 200-day MA
-- Buy less when price is above the 200-day MA
+using a Gradient Boosting classifier trained on 14 on-chain features
+identified through consensus feature selection (LASSO + RF + GBM) in Part 4.
+
+Model predicts P(favourable 30-day accumulation window) and converts
+predictions to buy multipliers:
+- High probability -> buy more (overweight)
+- Low probability -> buy less (underweight)
+- Budget remains neutral (weights sum to 1.0 per window)
+
+Walk-forward training retrains the model quarterly using only past data,
+ensuring no future information leaks into predictions.
 """
+
+import logging
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
 
 # =============================================================================
 # Constants
@@ -15,15 +27,50 @@ import pandas as pd
 
 PRICE_COL = "PriceUSD_coinmetrics"
 
+# Rolling window parameters
+ROLLING_WINDOW = 730  # 2-year lookback for z-scores (same as Part 2/4)
+MA_WINDOW = 200  # 200-day MA (kept for reference)
+
+# Walk-forward model parameters
+MIN_TRAIN_DAYS = 730  # Minimum training samples before model can predict
+RETRAIN_FREQ_DAYS = 90  # Retrain model quarterly
+FWD_HORIZON = 30  # 30-day forward return horizon for target
+
 # Strategy parameters
 MIN_W = 1e-6
-MA_WINDOW = 200  # 200-day simple moving average
-DYNAMIC_STRENGTH = 2.0  # Multiplier for weight adjustments
+DYNAMIC_STRENGTH = 4.0  # Multiplier scaling intensity
 
-# Feature column names (for compatibility)
-FEATS = [
-    "price_vs_ma",
+# GBM hyperparameters (from Part 4 notebook walk-forward CV)
+GBM_PARAMS = {
+    "n_estimators": 200,
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "min_samples_leaf": 20,
+    "subsample": 0.8,
+    "random_state": 42,
+}
+
+# 14 features selected via consensus ranking in Part 4 notebook
+# (LASSO + Random Forest + Gradient Boosting importance, threshold >= 0.15)
+SELECTED_FEATURES = [
+    "fee_zscore",
+    "CapMVRVCur",
+    "exch_supply_zscore",
+    "MVRV_zscore",
+    "price_mom_90d",
+    "MVRV_30d",
+    "price_zscore",
+    "hashrate_zscore",
+    "volatility_30d",
+    "fee_to_issuance_ratio",
+    "hashrate_mom_30d",
+    "NVT_14d",
+    "composite_signal",
+    "issuance_rate",
 ]
+
+# Feature column names (for compatibility with backtest framework)
+FEATS = SELECTED_FEATURES
 
 
 # =============================================================================
@@ -37,43 +84,238 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return ex / ex.sum()
 
 
+def _zscore_rolling(series: pd.Series, window: int = ROLLING_WINDOW) -> pd.Series:
+    """Compute rolling z-score with configurable lookback."""
+    rolling_mean = series.rolling(window, min_periods=window // 2).mean()
+    rolling_std = series.rolling(window, min_periods=window // 2).std()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        result = (series - rolling_mean) / rolling_std
+    return result
+
+
+def _pct_change(series: pd.Series, periods: int) -> pd.Series:
+    """Compute percentage change over N periods."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        result = series / series.shift(periods) - 1
+    return result
+
+
+# =============================================================================
+# Walk-Forward Model Training
+# =============================================================================
+
+
+def _generate_walk_forward_predictions(
+    features: pd.DataFrame,
+    price: pd.Series,
+) -> pd.Series:
+    """Generate out-of-sample GBM predictions via walk-forward retraining.
+
+    Retrains quarterly using all available past data. For each retrain
+    point, the model predicts forward until the next retrain point.
+
+    Target: 30-day forward return > expanding median (no look-ahead).
+
+    Args:
+        features: DataFrame with SELECTED_FEATURES columns (already lagged)
+        price: Unlagged price series for target computation
+
+    Returns:
+        Series of predicted P(favourable), NaN where model cannot predict
+    """
+    probas = pd.Series(np.nan, index=features.index)
+
+    # Forward returns for target construction (training only)
+    fwd_returns = price.shift(-FWD_HORIZON) / price - 1
+
+    # Identify dates where all features are finite (not NaN/Inf)
+    X_all = features[SELECTED_FEATURES].values
+    valid_mask = np.all(np.isfinite(X_all), axis=1)
+    valid_dates = features.index[valid_mask]
+
+    if len(valid_dates) < MIN_TRAIN_DAYS + 100:
+        logging.warning("Insufficient data for walk-forward GBM training")
+        return probas
+
+    # Quarterly retraining schedule
+    first_predict_date = valid_dates[MIN_TRAIN_DAYS]
+    retrain_schedule = pd.date_range(
+        start=first_predict_date,
+        end=valid_dates[-1],
+        freq=f"{RETRAIN_FREQ_DAYS}D",
+    )
+
+    logging.info(
+        f"Walk-forward GBM: {len(retrain_schedule)} retraining points, "
+        f"{len(valid_dates)} valid feature dates"
+    )
+
+    for rd_idx, retrain_date in enumerate(retrain_schedule):
+        # --- Training: all valid dates before this retrain point ---
+        train_dates = valid_dates[valid_dates < retrain_date]
+        if len(train_dates) < MIN_TRAIN_DAYS:
+            continue
+
+        X_train = features.loc[train_dates, SELECTED_FEATURES].values
+        fwd_ret_train = fwd_returns.loc[train_dates].values
+
+        # Exclude rows without valid forward returns (last 30 days of window)
+        valid_target = np.isfinite(fwd_ret_train)
+        X_train = X_train[valid_target]
+        fwd_ret_train = fwd_ret_train[valid_target]
+
+        if len(X_train) < 100:
+            continue
+
+        # Binary target: forward return > expanding median (no look-ahead)
+        expanding_med = pd.Series(fwd_ret_train).expanding().median().values
+        y_train = (fwd_ret_train > expanding_med).astype(int)
+
+        # Safety: remove any remaining NaN/Inf rows
+        valid_rows = np.isfinite(X_train).all(axis=1)
+        X_train = X_train[valid_rows]
+        y_train = y_train[valid_rows]
+
+        if len(X_train) < 100 or len(np.unique(y_train)) < 2:
+            continue
+
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+
+        model = GradientBoostingClassifier(**GBM_PARAMS)
+        model.fit(X_train_s, y_train)
+
+        # --- Predict: this retrain period until the next one ---
+        if rd_idx + 1 < len(retrain_schedule):
+            predict_end = retrain_schedule[rd_idx + 1]
+        else:
+            predict_end = valid_dates[-1] + pd.Timedelta(days=1)
+
+        predict_dates = valid_dates[
+            (valid_dates >= retrain_date) & (valid_dates < predict_end)
+        ]
+
+        if len(predict_dates) == 0:
+            continue
+
+        X_pred = features.loc[predict_dates, SELECTED_FEATURES].values
+        valid_pred = np.isfinite(X_pred).all(axis=1)
+
+        if valid_pred.any():
+            X_pred_s = scaler.transform(X_pred[valid_pred])
+            pred_probas = model.predict_proba(X_pred_s)[:, 1]
+            probas.loc[predict_dates[valid_pred]] = pred_probas
+
+    n_predicted = probas.notna().sum()
+    logging.info(f"Walk-forward GBM: generated {n_predicted} predictions")
+
+    return probas
+
+
 # =============================================================================
 # Feature Engineering
 # =============================================================================
 
 
 def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute 200-day MA feature for weight calculation.
+    """Compute 14 on-chain features and walk-forward GBM predictions.
 
-    Features (all lagged 1 day to prevent look-ahead bias):
-    - price_vs_ma: Normalized distance from 200-day MA, clipped to [-1, 1]
+    Features selected via consensus ranking (LASSO + RF + GBM) in Part 4:
+    - Valuation: CapMVRVCur, MVRV_30d, MVRV_zscore, NVT_14d, composite_signal
+    - Price: price_zscore, price_mom_90d, volatility_30d
+    - Exchange: exch_supply_zscore
+    - Mining: hashrate_zscore, hashrate_mom_30d, fee_zscore,
+              fee_to_issuance_ratio, issuance_rate
+
+    All features lagged 1 day to prevent look-ahead bias.
+    Model probability generated via quarterly walk-forward GBM retraining.
 
     Args:
-        df: DataFrame with price column
+        df: DataFrame with PriceUSD_coinmetrics and Coin Metrics on-chain columns
 
     Returns:
-        DataFrame with price and computed features
+        DataFrame with price, model_proba, and feature columns
     """
     if PRICE_COL not in df.columns:
         raise KeyError(f"'{PRICE_COL}' not found. Available: {list(df.columns)}")
 
     # Filter to valid date range
     price = df[PRICE_COL].loc["2010-07-18":].copy()
+    idx = price.index
+    nan_s = pd.Series(np.nan, index=idx)
 
-    # 200-day MA and distance
-    ma = price.rolling(MA_WINDOW, min_periods=MA_WINDOW // 2).mean()
-    with np.errstate(divide="ignore", invalid="ignore"):
-        price_vs_ma = ((price / ma) - 1).clip(-1, 1).fillna(0)
+    # --- Extract raw on-chain columns ---
+    mvrv = df["CapMVRVCur"].reindex(idx) if "CapMVRVCur" in df.columns else nan_s.copy()
+    cap_mkt = df["CapMrktCurUSD"].reindex(idx) if "CapMrktCurUSD" in df.columns else nan_s.copy()
+    vol_spot = df["volume_reported_spot_usd_1d"].reindex(idx) if "volume_reported_spot_usd_1d" in df.columns else nan_s.copy()
+    fee_tot = df["FeeTotNtv"].reindex(idx) if "FeeTotNtv" in df.columns else nan_s.copy()
+    iss_tot = df["IssTotNtv"].reindex(idx) if "IssTotNtv" in df.columns else nan_s.copy()
+    sply_ex = df["SplyExNtv"].reindex(idx) if "SplyExNtv" in df.columns else nan_s.copy()
+    sply_cur = df["SplyCur"].reindex(idx) if "SplyCur" in df.columns else nan_s.copy()
+    hashrate = df["HashRate"].reindex(idx) if "HashRate" in df.columns else nan_s.copy()
 
-    # Build and lag features
+    # --- Derived metrics ---
+    nvt_14d = cap_mkt / vol_spot.rolling(14).mean()
+    mvrv_30d = mvrv.rolling(30).mean()
+
+    # --- Z-scores (2-year rolling lookback) ---
+    mvrv_zscore = _zscore_rolling(mvrv)
+    nvt_zscore = _zscore_rolling(nvt_14d)
+    price_zscore = _zscore_rolling(price)
+    hashrate_zscore = _zscore_rolling(hashrate)
+    fee_zscore = _zscore_rolling(fee_tot)
+    exch_supply_ratio = sply_ex / sply_cur
+    exch_supply_zscore = _zscore_rolling(exch_supply_ratio)
+
+    # --- Composite valuation signal (MVRV + NVT z-scores averaged) ---
+    composite = pd.Series(np.nan, index=idx)
+    both_valid = mvrv_zscore.notna() & nvt_zscore.notna() & np.isfinite(nvt_zscore)
+    mvrv_only = mvrv_zscore.notna() & ~both_valid
+    composite.loc[both_valid] = (mvrv_zscore[both_valid] + nvt_zscore[both_valid]) / 2
+    composite.loc[mvrv_only] = mvrv_zscore[mvrv_only]
+
+    # --- Momentum features ---
+    price_mom_90d = _pct_change(price, 90)
+    daily_return = price / price.shift(1) - 1
+    volatility_30d = daily_return.rolling(30).std()
+    hashrate_mom_30d = _pct_change(hashrate, 30)
+
+    # --- Mining / supply features ---
+    fee_to_issuance_ratio = fee_tot / iss_tot
+    issuance_rate = iss_tot / sply_cur
+
+    # --- Build features DataFrame ---
     features = pd.DataFrame(
         {
             PRICE_COL: price,
-            "price_ma": ma,
-            "price_vs_ma": price_vs_ma.shift(1).fillna(0),  # Lag 1 day
+            "CapMVRVCur": mvrv,
+            "MVRV_30d": mvrv_30d,
+            "MVRV_zscore": mvrv_zscore,
+            "NVT_14d": nvt_14d,
+            "composite_signal": composite,
+            "price_zscore": price_zscore,
+            "price_mom_90d": price_mom_90d,
+            "volatility_30d": volatility_30d,
+            "hashrate_zscore": hashrate_zscore,
+            "hashrate_mom_30d": hashrate_mom_30d,
+            "fee_zscore": fee_zscore,
+            "fee_to_issuance_ratio": fee_to_issuance_ratio,
+            "issuance_rate": issuance_rate,
+            "exch_supply_zscore": exch_supply_zscore,
         },
-        index=price.index,
+        index=idx,
     )
+
+    # --- Lag all model features by 1 day (prevent look-ahead) ---
+    for col in SELECTED_FEATURES:
+        features[col] = features[col].shift(1)
+
+    # --- Walk-forward GBM predictions ---
+    logging.info("Running walk-forward GBM training...")
+    features["model_proba"] = _generate_walk_forward_predictions(features, price)
+
+    # NaN model_proba → 0.5 (neutral / uniform weighting during warmup)
+    features["model_proba"] = features["model_proba"].fillna(0.5)
 
     return features
 
@@ -161,23 +403,24 @@ def allocate_sequential_stable(
 # =============================================================================
 
 
-def compute_dynamic_multiplier(price_vs_ma: np.ndarray) -> np.ndarray:
-    """Compute weight multiplier from 200-day MA signal.
+def compute_dynamic_multiplier(model_proba: np.ndarray) -> np.ndarray:
+    """Compute weight multiplier from GBM probability signal.
 
-    Simple strategy: buy more when price is below MA, less when above.
+    Maps P(favourable) to buy multiplier via exponential scaling:
+    - P > 0.5 -> multiplier > 1 (buy more)
+    - P < 0.5 -> multiplier < 1 (buy less)
+    - P = 0.5 -> multiplier = 1 (neutral / uniform)
 
     Args:
-        price_vs_ma: Distance from 200-day MA in [-1, 1]
-            Negative values = below MA (buy more)
-            Positive values = above MA (buy less)
+        model_proba: Predicted P(favourable) in [0, 1]
 
     Returns:
         Multipliers centered around 1.0
     """
-    # Signal: negative price_vs_ma = below MA = buy more
-    signal = -price_vs_ma
+    # Center around 0 and scale to [-1, 1]
+    signal = (model_proba - 0.5) * 2
 
-    # Scale and clip
+    # Apply strength and clip
     adjustment = signal * DYNAMIC_STRENGTH
     adjustment = np.clip(adjustment, -3, 3)
 
@@ -221,11 +464,12 @@ def compute_weights_fast(
     n = len(df)
     base = np.ones(n) / n
 
-    # Extract and clean features
-    price_vs_ma = _clean_array(df["price_vs_ma"].values)
+    # Extract model probability (0.5 = neutral for missing/placeholder dates)
+    model_proba = _clean_array(df["model_proba"].values)
+    model_proba = np.where(model_proba < 1e-6, 0.5, model_proba)
 
-    # Compute dynamic weights
-    dyn = compute_dynamic_multiplier(price_vs_ma)
+    # Compute dynamic weights from GBM probability
+    dyn = compute_dynamic_multiplier(model_proba)
     raw = base * dyn
 
     # Allocate with stability
@@ -261,13 +505,12 @@ def compute_window_weights(
     """
     full_range = pd.date_range(start=start_date, end=end_date, freq="D")
 
-    # Extend features for future dates
+    # Extend features for future dates (model_proba defaults to 0.5 = neutral)
     missing = full_range.difference(features_df.index)
     if len(missing) > 0:
-        placeholder = pd.DataFrame(
-            {col: 0.0 for col in features_df.columns},
-            index=missing,
-        )
+        placeholder_vals = {col: 0.0 for col in features_df.columns}
+        placeholder_vals["model_proba"] = 0.5
+        placeholder = pd.DataFrame(placeholder_vals, index=missing)
         features_df = pd.concat([features_df, placeholder]).sort_index()
 
     # Determine past/future split
